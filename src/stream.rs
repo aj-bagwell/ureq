@@ -33,6 +33,7 @@ pub enum Stream {
     Cursor(Cursor<Vec<u8>>),
     #[cfg(test)]
     Test(Box<dyn Read + Send>, Vec<u8>),
+    Empty,
 }
 
 // DeadlineStream wraps a stream such that read() will return an error
@@ -48,6 +49,10 @@ pub struct DeadlineStream {
 impl DeadlineStream {
     pub(crate) fn new(stream: Stream, deadline: Option<Instant>) -> Self {
         DeadlineStream { stream, deadline }
+    }
+    #[cfg(test)]
+    pub fn to_write_vec(&self) -> Vec<u8> {
+        self.stream.to_write_vec()
     }
 }
 
@@ -74,6 +79,22 @@ impl Read for DeadlineStream {
             }
         }
         self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, std::io::Error> {
+        if let Some(deadline) = self.deadline {
+            let timeout = time_until_deadline(deadline)?;
+            if let Some(socket) = self.stream.socket() {
+                socket.set_read_timeout(Some(timeout))?;
+                socket.set_write_timeout(Some(timeout))?;
+            }
+        }
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> std::result::Result<(), std::io::Error> {
+        self.stream.flush()
     }
 }
 
@@ -105,6 +126,7 @@ impl ::std::fmt::Debug for Stream {
                 Stream::Cursor(_) => "cursor",
                 #[cfg(test)]
                 Stream::Test(_, _) => "test",
+                Stream::Empty => "empty",
             }
         )
     }
@@ -179,6 +201,7 @@ impl Read for Stream {
             Stream::Cursor(read) => read.read(buf),
             #[cfg(test)]
             Stream::Test(reader, _) => reader.read(buf),
+            Stream::Empty => Ok(0),
         }
     }
 }
@@ -242,6 +265,7 @@ impl Write for Stream {
             Stream::Cursor(_) => panic!("Write to read only stream"),
             #[cfg(test)]
             Stream::Test(_, writer) => writer.write(buf),
+            Stream::Empty => panic!("Write to read only stream"),
         }
     }
     fn flush(&mut self) -> IoResult<()> {
@@ -255,6 +279,7 @@ impl Write for Stream {
             Stream::Cursor(_) => panic!("Flush read only stream"),
             #[cfg(test)]
             Stream::Test(_, writer) => writer.flush(),
+            Stream::Empty => panic!("Flush read only stream"),
         }
     }
 }

@@ -80,10 +80,14 @@ pub fn has_header(headers: &[Header], name: &str) -> bool {
     get_header(headers, name).is_some()
 }
 
+pub fn remove_header(headers: &mut Vec<Header>, name: &str) {
+    headers.retain(|h| !h.is_name(name));
+}
+
 pub fn add_header(headers: &mut Vec<Header>, header: Header) {
     let name = header.name();
     if !name.starts_with("x-") && !name.starts_with("X-") {
-        headers.retain(|h| h.name() != name);
+        remove_header(headers, name);
     }
     headers.push(header);
 }

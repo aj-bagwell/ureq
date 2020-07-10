@@ -1,5 +1,4 @@
-use crate::stream::Stream;
-use std::io::{copy, empty, Cursor, Read, Result as IoResult, Write};
+use std::io::{empty, Cursor, Read, Result as IoResult, Write};
 
 #[cfg(feature = "charset")]
 use crate::response::DEFAULT_CHARACTER_SET;
@@ -108,7 +107,7 @@ const CHUNK_MAX_PAYLOAD_SIZE: usize = CHUNK_MAX_SIZE - CHUNK_HEADER_MAX_SIZE - C
 // 2) chunked_transfer's Encoder issues 4 separate write() per chunk. This is costly
 //    overhead. Instead, we do a single write() per chunk.
 // The measured benefit on a Linux machine is a 50% reduction in CPU usage on a https connection.
-fn copy_chunked<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> IoResult<u64> {
+pub(crate) fn copy_chunked<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> IoResult<u64> {
     // The chunk layout is:
     // header:header_max_size | payload:max_payload_size | footer:footer_size
     let mut chunk = Vec::with_capacity(CHUNK_MAX_SIZE);
@@ -119,6 +118,11 @@ fn copy_chunked<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> IoResult<u
         let payload_size = reader
             .take(CHUNK_MAX_PAYLOAD_SIZE as u64)
             .read_to_end(&mut chunk)?;
+
+        // On EOF, don write a 0 sized chunk. It will be written by end chunked.
+        if payload_size == 0 {
+            return Ok(written);
+        }
 
         // Then write the header
         let header_str = format!("{:x}\r\n", payload_size);
@@ -133,12 +137,13 @@ fn copy_chunked<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> IoResult<u
         // Finally Write the chunk
         writer.write_all(&chunk[start_index..])?;
         written += payload_size as u64;
-
-        // On EOF, we wrote a 0 sized chunk. This is what the chunked encoding protocol requires.
-        if payload_size == 0 {
-            return Ok(written);
-        }
     }
+}
+
+pub(crate) fn end_chunked<W: Write>(writer: &mut W) -> IoResult<()> {
+    // Finally Write the chunk which is just a chunk of length 0
+    writer.write_all(b"0\r\n\r\n")?;
+    Ok(())
 }
 
 #[test]
@@ -149,6 +154,7 @@ fn test_copy_chunked() {
 
     let mut dest = Vec::<u8>::new();
     copy_chunked(&mut &source[..], &mut dest).unwrap();
+    end_chunked(&mut dest).unwrap();
 
     let mut dest_expected = Vec::<u8>::new();
     dest_expected.extend_from_slice(format!("{:x}\r\n", CHUNK_MAX_PAYLOAD_SIZE).as_bytes());
@@ -159,19 +165,4 @@ fn test_copy_chunked() {
     dest_expected.extend_from_slice(b"0\r\n\r\n");
 
     assert_eq!(dest, dest_expected);
-}
-
-/// Helper to send a body, either as chunked or not.
-pub(crate) fn send_body(
-    mut body: SizedReader,
-    do_chunk: bool,
-    stream: &mut Stream,
-) -> IoResult<()> {
-    if do_chunk {
-        copy_chunked(&mut body.reader, stream)?;
-    } else {
-        copy(&mut body.reader, stream)?;
-    };
-
-    Ok(())
 }

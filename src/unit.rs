@@ -9,7 +9,6 @@ use url::Url;
 use cookie::{Cookie, CookieJar};
 
 use crate::agent::AgentState;
-use crate::body::{self, Payload, SizedReader};
 use crate::header;
 use crate::stream::{self, connect_test, Stream};
 use crate::Proxy;
@@ -24,7 +23,7 @@ use crate::pool::DEFAULT_HOST;
 /// It's a "unit of work". Maybe a bad name for it?
 ///
 /// *Internal API*
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Unit {
     pub agent: Arc<Mutex<Option<AgentState>>>,
     pub url: Url,
@@ -35,6 +34,7 @@ pub(crate) struct Unit {
     pub timeout_read: u64,
     pub timeout_write: u64,
     pub deadline: Option<time::Instant>,
+    pub redirects: u32,
     pub method: String,
     pub proxy: Option<Proxy>,
     #[cfg(feature = "tls")]
@@ -44,7 +44,12 @@ pub(crate) struct Unit {
 impl Unit {
     //
 
-    pub(crate) fn new(req: &Request, url: &Url, mix_queries: bool, body: &SizedReader) -> Self {
+    pub(crate) fn new(
+        req: &Request,
+        url: &Url,
+        mix_queries: bool,
+        body_size: Option<usize>,
+    ) -> Self {
         //
 
         let is_chunked = req
@@ -64,7 +69,7 @@ impl Unit {
             // chunking and Content-Length headers are mutually exclusive
             // also don't write this if the user has set it themselves
             if !is_chunked && !req.has("content-length") {
-                if let Some(size) = body.size {
+                if let Some(size) = body_size {
                     extra.push(Header::new("Content-Length", &format!("{}", size)));
                 }
             }
@@ -104,10 +109,40 @@ impl Unit {
             timeout_read: req.timeout_read,
             timeout_write: req.timeout_write,
             deadline,
+            redirects: req.redirects,
             method: req.method.clone(),
             proxy: req.proxy.clone(),
             #[cfg(feature = "tls")]
             tls_config: req.tls_config.clone(),
+        }
+    }
+    pub fn redirect_to(&self, url: Url) -> Self {
+        let mut headers = self.headers.clone();
+        header::remove_header(&mut headers, "Authorization");
+        header::remove_header(&mut headers, "Content-Length");
+
+        // this is to follow how curl does it. POST, PUT etc change
+        // to GET on a redirect.
+        let method = match &self.method[..] {
+            "GET" | "HEAD" => self.method.clone(),
+            _ => "GET".into(),
+        };
+
+        Unit {
+            agent: Arc::clone(&self.agent),
+            url: url.clone(),
+            is_chunked: false,
+            query_string: "?".to_owned() + url.query().unwrap_or(""),
+            headers: headers,
+            timeout_connect: self.timeout_connect,
+            timeout_read: self.timeout_read,
+            timeout_write: self.timeout_write,
+            deadline: self.deadline,
+            redirects: self.redirects - 1,
+            method: method,
+            proxy: self.proxy.clone(),
+            #[cfg(feature = "tls")]
+            tls_config: self.tls_config.clone(),
         }
     }
 
@@ -129,106 +164,26 @@ impl Unit {
     }
 }
 
-/// Perform a connection. Used recursively for redirects.
-pub(crate) fn connect(
-    req: &Request,
-    unit: Unit,
+pub(crate) fn connect_and_send_prelude(
+    unit: &Unit,
     use_pooled: bool,
-    redirect_count: u32,
-    body: SizedReader,
-    redir: bool,
-) -> Result<Response, Error> {
-    //
-
+) -> Result<(Stream, bool), Error> {
     // open socket
-    let (mut stream, is_recycled) = connect_socket(&unit, use_pooled)?;
+    let (mut stream, is_recycled) = connect_socket(unit, use_pooled)?;
 
-    let send_result = send_prelude(&unit, &mut stream, redir);
+    let send_result = send_prelude(unit, &mut stream);
 
     if let Err(err) = send_result {
         if is_recycled {
             // we try open a new connection, this time there will be
             // no connection in the pool. don't use it.
-            return connect(req, unit, false, redirect_count, body, redir);
+            return connect_and_send_prelude(unit, false);
         } else {
             // not a pooled connection, propagate the error.
             return Err(err.into());
         }
     }
-    let retryable = req.is_retryable(&body);
-
-    // send the body (which can be empty now depending on redirects)
-    body::send_body(body, unit.is_chunked, &mut stream)?;
-
-    // start reading the response to process cookies and redirects.
-    let mut stream = stream::DeadlineStream::new(stream, unit.deadline);
-    let mut resp = Response::from_read(&mut stream);
-
-    // https://tools.ietf.org/html/rfc7230#section-6.3.1
-    // When an inbound connection is closed prematurely, a client MAY
-    // open a new connection and automatically retransmit an aborted
-    // sequence of requests if all of those requests have idempotent
-    // methods.
-    //
-    // We choose to retry only once. To do that, we rely on is_recycled,
-    // the "one connection per hostname" police of the ConnectionPool,
-    // and the fact that connections with errors are dropped.
-    //
-    // TODO: is_bad_status_read is too narrow since it covers only the
-    // first line. It's also allowable to retry requests that hit a
-    // closed connection during the sending or receiving of headers.
-    if let Some(err) = resp.synthetic_error() {
-        if err.is_bad_status_read() && retryable && is_recycled {
-            let empty = Payload::Empty.into_read();
-            return connect(req, unit, false, redirect_count, empty, redir);
-        }
-    }
-
-    // squirrel away cookies
-    save_cookies(&unit, &resp);
-
-    // handle redirects
-    if resp.redirect() && req.redirects > 0 {
-        if redirect_count == req.redirects {
-            return Err(Error::TooManyRedirects);
-        }
-
-        // the location header
-        let location = resp.header("location");
-        if let Some(location) = location {
-            // join location header to current url in case it it relative
-            let new_url = unit
-                .url
-                .join(location)
-                .map_err(|_| Error::BadUrl(format!("Bad redirection: {}", location)))?;
-
-            // perform the redirect differently depending on 3xx code.
-            match resp.status() {
-                301 | 302 | 303 => {
-                    let empty = Payload::Empty.into_read();
-                    // recreate the unit to get a new hostname and cookies for the new host.
-                    let mut new_unit = Unit::new(req, &new_url, false, &empty);
-                    // this is to follow how curl does it. POST, PUT etc change
-                    // to GET on a redirect.
-                    new_unit.method = match &unit.method[..] {
-                        "GET" | "HEAD" => unit.method,
-                        _ => "GET".into(),
-                    };
-                    return connect(req, new_unit, use_pooled, redirect_count + 1, empty, true);
-                }
-                _ => (),
-                // reinstate this with expect-100
-                // 307 | 308 | _ => connect(unit, method, use_pooled, redirects - 1, body),
-            };
-        }
-    }
-
-    // since it is not a redirect, or we're not following redirects,
-    // give away the incoming stream to the response object.
-    crate::response::set_stream(&mut resp, unit.url.to_string(), Some(unit), stream.into());
-
-    // release the response
-    Ok(resp)
+    Ok((stream, is_recycled))
 }
 
 #[cfg(feature = "cookie")]
@@ -320,7 +275,7 @@ fn connect_socket(unit: &Unit, use_pooled: bool) -> Result<(Stream, bool), Error
 
 /// Send request line + headers (all up until the body).
 #[allow(clippy::write_with_newline)]
-fn send_prelude(unit: &Unit, stream: &mut Stream, redir: bool) -> IoResult<()> {
+fn send_prelude(unit: &Unit, stream: &mut Stream) -> IoResult<()> {
     //
 
     // build into a buffer and send in one go.
@@ -365,9 +320,7 @@ fn send_prelude(unit: &Unit, stream: &mut Stream, redir: bool) -> IoResult<()> {
 
     // other headers
     for header in &unit.headers {
-        if !redir || !header.is_name("Authorization") {
-            write!(prelude, "{}: {}\r\n", header.name(), header.value())?;
-        }
+        write!(prelude, "{}: {}\r\n", header.name(), header.value())?;
     }
 
     // finish
@@ -380,11 +333,11 @@ fn send_prelude(unit: &Unit, stream: &mut Stream, redir: bool) -> IoResult<()> {
 }
 
 #[cfg(not(feature = "cookie"))]
-fn save_cookies(_unit: &Unit, _resp: &Response) {}
+pub(crate) fn save_cookies(_unit: &Unit, _resp: &Response) {}
 
 /// Investigate a response for "Set-Cookie" headers.
 #[cfg(feature = "cookie")]
-fn save_cookies(unit: &Unit, resp: &Response) {
+pub(crate) fn save_cookies(unit: &Unit, resp: &Response) {
     //
 
     let cookies = resp.all("set-cookie");

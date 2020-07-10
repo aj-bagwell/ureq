@@ -1,4 +1,5 @@
-use std::io::Read;
+use crate::write::RequestWrite;
+use std::io::{copy, Read};
 use std::sync::{Arc, Mutex};
 use std::time;
 
@@ -9,7 +10,7 @@ use url::{form_urlencoded, Url};
 use std::fmt;
 
 use crate::agent::{self, Agent, AgentState};
-use crate::body::{Payload, SizedReader};
+use crate::body::Payload;
 use crate::error::Error;
 use crate::header::{self, Header};
 use crate::pool;
@@ -109,9 +110,11 @@ impl Request {
     fn do_call(&mut self, payload: Payload) -> Response {
         self.to_url()
             .and_then(|url| {
-                let reader = payload.into_read();
-                let unit = Unit::new(&self, &url, true, &reader);
-                unit::connect(&self, unit, true, 0, reader, false)
+                let mut body = payload.into_read();
+                let unit = Unit::new(&self, &url, true, body.size);
+                let mut write = RequestWrite::new(unit)?;
+                copy(&mut body.reader, &mut write)?;
+                Ok(write.finish())
             })
             .unwrap_or_else(|e| e.into())
     }
@@ -226,6 +229,29 @@ impl Request {
     /// ```
     pub fn send(&mut self, reader: impl Read + 'static) -> Response {
         self.do_call(Payload::Reader(Box::new(reader)))
+    }
+
+    /// Send data via a writer.
+    ///
+    /// The `Content-Length` header is not set because we can't know the length that will be written.
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// let text = b"Hello there!\n";
+    ///
+    /// let mut body = ureq::post("http://example.com/somewhere")
+    ///     .into_write().unwrap();
+    ///
+    ///  body.write(text);
+    ///
+    ///  let resp = body.finish();
+    /// ```
+    pub fn into_write(&self) -> Result<RequestWrite, Error> {
+        self.to_url().and_then(|url| {
+            let unit = Unit::new(&self, &url, true, None);
+            RequestWrite::new(unit)
+        })
     }
 
     /// Set a header field.
@@ -597,22 +623,6 @@ impl Request {
     pub fn set_tls_config(&mut self, tls_config: Arc<rustls::ClientConfig>) -> &mut Request {
         self.tls_config = Some(TLSClientConfig(tls_config));
         self
-    }
-
-    // Returns true if this request, with the provided body, is retryable.
-    pub(crate) fn is_retryable(&self, body: &SizedReader) -> bool {
-        // Per https://tools.ietf.org/html/rfc7231#section-8.1.3
-        // these methods are idempotent.
-        let idempotent = match self.method.as_str() {
-            "DELETE" | "GET" | "HEAD" | "OPTIONS" | "PUT" | "TRACE" => true,
-            _ => false,
-        };
-        // Unsized bodies aren't retryable because we can't rewind the reader.
-        // Sized bodies are retryable only if they are zero-length because of
-        // coincidences of the current implementation - the function responsible
-        // for retries doesn't have a way to replay a Payload.
-        let no_body = body.size.is_none() || body.size.unwrap() > 0;
-        idempotent && no_body
     }
 }
 

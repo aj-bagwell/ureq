@@ -1,6 +1,5 @@
 use std::io::{Cursor, Error as IoError, ErrorKind, Read, Result as IoResult};
 use std::str::FromStr;
-use std::time::Instant;
 
 use chunked_transfer::Decoder as ChunkDecoder;
 
@@ -54,8 +53,7 @@ pub struct Response {
     status: u16,
     headers: Vec<Header>,
     unit: Option<Unit>,
-    stream: Option<Stream>,
-    deadline: Option<Instant>,
+    stream: Option<DeadlineStream>,
 }
 
 /// index into status_line where we split: HTTP/1.1 200 OK
@@ -321,8 +319,6 @@ impl Response {
 
         let stream = self.stream.expect("No reader in response?!");
         let unit = self.unit;
-        let deadline = unit.as_ref().and_then(|u| u.deadline);
-        let stream = DeadlineStream::new(stream, deadline);
 
         match (use_chunked, limit_bytes) {
             (true, _) => {
@@ -491,7 +487,6 @@ impl Response {
             headers,
             unit: None,
             stream: None,
-            deadline: None,
         })
     }
 
@@ -550,7 +545,12 @@ impl FromStr for Response {
         let bytes = s.as_bytes().to_owned();
         let mut cursor = Cursor::new(bytes);
         let mut resp = Self::do_from_read(&mut cursor)?;
-        set_stream(&mut resp, "".into(), None, Stream::Cursor(cursor));
+        set_stream(
+            &mut resp,
+            "".into(),
+            None,
+            DeadlineStream::new(Stream::Cursor(cursor), None),
+        );
         Ok(resp)
     }
 }
@@ -569,11 +569,13 @@ impl Into<Response> for Error {
 /// "Give away" Unit and Stream to the response.
 ///
 /// *Internal API*
-pub(crate) fn set_stream(resp: &mut Response, url: String, unit: Option<Unit>, stream: Stream) {
+pub(crate) fn set_stream(
+    resp: &mut Response,
+    url: String,
+    unit: Option<Unit>,
+    stream: DeadlineStream,
+) {
     resp.url = Some(url);
-    if let Some(unit) = &unit {
-        resp.deadline = unit.deadline;
-    }
     resp.unit = unit;
     resp.stream = Some(stream);
 }
